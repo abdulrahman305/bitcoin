@@ -289,6 +289,9 @@ public:
     //! Check if any block has been pruned.
     virtual bool havePruned() = 0;
 
+    //! Get the current prune height.
+    virtual std::optional<int> getPruneHeight() = 0;
+
     //! Check if the node is ready to broadcast transactions.
     virtual bool isReadyToBroadcast() = 0;
 
@@ -403,9 +406,6 @@ public:
 
     //! Start client execution and provide a scheduler.
     virtual void start(CScheduler& scheduler) = 0;
-
-    //! Save state to disk.
-    virtual void flush() = 0;
 
     //! Shut down client.
     virtual void stop() = 0;

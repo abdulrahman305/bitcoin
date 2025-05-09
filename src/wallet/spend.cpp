@@ -508,8 +508,6 @@ std::map<CTxDestination, std::vector<COutput>> ListCoins(const CWallet& wallet)
     std::map<CTxDestination, std::vector<COutput>> result;
 
     CCoinControl coin_control;
-    // Include watch-only for LegacyScriptPubKeyMan wallets without private keys
-    coin_control.fAllowWatchOnly = wallet.GetLegacyScriptPubKeyMan() && wallet.IsWalletFlagSet(WALLET_FLAG_DISABLE_PRIVATE_KEYS);
     CoinFilterParams coins_params;
     coins_params.only_spendable = false;
     coins_params.skip_locked = false;
@@ -1138,7 +1136,7 @@ static util::Result<CreatedTransactionResult> CreateTransactionInternal(
     // This can only happen if feerate is 0, and requested destinations are value of 0 (e.g. OP_RETURN)
     // and no pre-selected inputs. This will result in 0-input transaction, which is consensus-invalid anyways
     if (selection_target == 0 && !coin_control.HasSelected()) {
-        return util::Error{_("Transaction requires one destination of non-0 value, a non-0 feerate, or a pre-selected input")};
+        return util::Error{_("Transaction requires one destination of non-zero value, a non-zero feerate, or a pre-selected input")};
     }
 
     // Fetch manually selected coins
