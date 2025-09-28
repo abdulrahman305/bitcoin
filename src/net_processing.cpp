@@ -167,7 +167,7 @@ static constexpr auto INBOUND_INVENTORY_BROADCAST_INTERVAL{5s};
 static constexpr auto OUTBOUND_INVENTORY_BROADCAST_INTERVAL{2s};
 /** Maximum rate of inventory items to send per second.
  *  Limits the impact of low-fee transaction floods. */
-static constexpr unsigned int INVENTORY_BROADCAST_PER_SECOND = 7;
+static constexpr unsigned int INVENTORY_BROADCAST_PER_SECOND{14};
 /** Target number of tx inventory items to send per transmission. */
 static constexpr unsigned int INVENTORY_BROADCAST_TARGET = INVENTORY_BROADCAST_PER_SECOND * count_seconds(INBOUND_INVENTORY_BROADCAST_INTERVAL);
 /** Maximum number of inventory items to send per transmission. */
@@ -312,7 +312,7 @@ struct Peer {
         std::chrono::microseconds m_next_inv_send_time GUARDED_BY(m_tx_inventory_mutex){0};
         /** The mempool sequence num at which we sent the last `inv` message to this peer.
          *  Can relay txs with lower sequence numbers than this (see CTxMempool::info_for_relay). */
-        uint64_t m_last_inv_sequence GUARDED_BY(NetEventsInterface::g_msgproc_mutex){1};
+        uint64_t m_last_inv_sequence GUARDED_BY(m_tx_inventory_mutex){1};
 
         /** Minimum fee rate with which to filter transaction announcements to this node. See BIP133. */
         std::atomic<CAmount> m_fee_filter_received{0};
@@ -942,7 +942,7 @@ private:
 
     /** Determine whether or not a peer can request a transaction, and return it (or nullptr if not found or not allowed). */
     CTransactionRef FindTxForGetData(const Peer::TxRelay& tx_relay, const GenTxid& gtxid)
-        EXCLUSIVE_LOCKS_REQUIRED(!m_most_recent_block_mutex, NetEventsInterface::g_msgproc_mutex);
+        EXCLUSIVE_LOCKS_REQUIRED(!m_most_recent_block_mutex, !tx_relay.m_tx_inventory_mutex);
 
     void ProcessGetData(CNode& pfrom, Peer& peer, const std::atomic<bool>& interruptMsgProc)
         EXCLUSIVE_LOCKS_REQUIRED(!m_most_recent_block_mutex, peer.m_getdata_requests_mutex, NetEventsInterface::g_msgproc_mutex)
@@ -1728,9 +1728,13 @@ bool PeerManagerImpl::GetNodeStateStats(NodeId nodeid, CNodeStateStats& stats) c
     if (auto tx_relay = peer->GetTxRelay(); tx_relay != nullptr) {
         stats.m_relay_txs = WITH_LOCK(tx_relay->m_bloom_filter_mutex, return tx_relay->m_relay_txs);
         stats.m_fee_filter_received = tx_relay->m_fee_filter_received.load();
+        LOCK(tx_relay->m_tx_inventory_mutex);
+        stats.m_last_inv_seq = tx_relay->m_last_inv_sequence;
+        stats.m_inv_to_send = tx_relay->m_tx_inventory_to_send.size();
     } else {
         stats.m_relay_txs = false;
         stats.m_fee_filter_received = 0;
+        stats.m_inv_to_send = 0;
     }
 
     stats.m_ping_wait = ping_wait;
@@ -2362,8 +2366,8 @@ CTransactionRef PeerManagerImpl::FindTxForGetData(const Peer::TxRelay& tx_relay,
 {
     // If a tx was in the mempool prior to the last INV for this peer, permit the request.
     auto txinfo{std::visit(
-        [&](const auto& id) EXCLUSIVE_LOCKS_REQUIRED(NetEventsInterface::g_msgproc_mutex) {
-            return m_mempool.info_for_relay(id, tx_relay.m_last_inv_sequence);
+        [&](const auto& id) {
+            return m_mempool.info_for_relay(id, WITH_LOCK(tx_relay.m_tx_inventory_mutex, return tx_relay.m_last_inv_sequence));
         },
         gtxid)};
     if (txinfo.tx) {
@@ -3329,6 +3333,16 @@ void PeerManagerImpl::ProcessCompactBlockTxns(CNode& pfrom, Peer& peer, const Bl
 
         PartiallyDownloadedBlock& partialBlock = *range_flight.first->second.second->partialBlock;
 
+        if (partialBlock.header.IsNull()) {
+            // It is possible for the header to be empty if a previous call to FillBlock wiped the header, but left
+            // the PartiallyDownloadedBlock pointer around (i.e. did not call RemoveBlockRequest). In this case, we
+            // should not call LookupBlockIndex below.
+            RemoveBlockRequest(block_transactions.blockhash, pfrom.GetId());
+            Misbehaving(peer, "previous compact block reconstruction attempt failed");
+            LogDebug(BCLog::NET, "Peer %d sent compact block transactions multiple times", pfrom.GetId());
+            return;
+        }
+
         // We should not have gotten this far in compact block processing unless it's attached to a known header
         const CBlockIndex* prev_block{Assume(m_chainman.m_blockman.LookupBlockIndex(partialBlock.header.hashPrevBlock))};
         ReadStatus status = partialBlock.FillBlock(*pblock, block_transactions.txn,
@@ -3340,6 +3354,9 @@ void PeerManagerImpl::ProcessCompactBlockTxns(CNode& pfrom, Peer& peer, const Bl
         } else if (status == READ_STATUS_FAILED) {
             if (first_in_flight) {
                 // Might have collided, fall back to getdata now :(
+                // We keep the failed partialBlock to disallow processing another compact block announcement from the same
+                // peer for the same block. We let the full block download below continue under the same m_downloading_since
+                // timer.
                 std::vector<CInv> invs;
                 invs.emplace_back(MSG_BLOCK | GetFetchFlags(peer), block_transactions.blockhash);
                 MakeAndPushMessage(pfrom, NetMsgType::GETDATA, invs);

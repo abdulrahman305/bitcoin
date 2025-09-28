@@ -1634,7 +1634,11 @@ bool CWallet::IsMine(const COutPoint& outpoint) const
 
 bool CWallet::IsFromMe(const CTransaction& tx) const
 {
-    return (GetDebit(tx) > 0);
+    LOCK(cs_wallet);
+    for (const CTxIn& txin : tx.vin) {
+        if (GetTXO(txin.prevout)) return true;
+    }
+    return false;
 }
 
 CAmount CWallet::GetDebit(const CTransaction& tx) const
@@ -3687,9 +3691,7 @@ util::Result<std::reference_wrapper<DescriptorScriptPubKeyMan>> CWallet::AddWall
 {
     AssertLockHeld(cs_wallet);
 
-    if (!IsWalletFlagSet(WALLET_FLAG_DESCRIPTORS)) {
-        return util::Error{_("Cannot add WalletDescriptor to a non-descriptor wallet")};
-    }
+    Assert(IsWalletFlagSet(WALLET_FLAG_DESCRIPTORS));
 
     auto spk_man = GetDescriptorScriptPubKeyMan(desc);
     if (spk_man) {
@@ -3882,7 +3884,7 @@ util::Result<void> CWallet::ApplyMigrationData(WalletBatch& local_wallet_batch, 
     m_internal_spk_managers.clear();
 
     // Setup new descriptors (only if we are migrating any key material)
-    SetWalletFlagWithDB(local_wallet_batch, WALLET_FLAG_DESCRIPTORS);
+    SetWalletFlagWithDB(local_wallet_batch, WALLET_FLAG_DESCRIPTORS | WALLET_FLAG_LAST_HARDENED_XPUB_CACHED);
     if (has_spendable_material && !IsWalletFlagSet(WALLET_FLAG_DISABLE_PRIVATE_KEYS)) {
         // Use the existing master key if we have it
         if (data.master_key.key.IsValid()) {
